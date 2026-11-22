@@ -38,8 +38,8 @@ crons = ["*/5 * * * *"]
 # D1 — relational data (posts, comments, settings, ...)
 [[d1_databases]]
 binding = "DB"
-database_name = "putixin"
-database_id = "7dd4d2a5-439a-4797-99c2-5efce9b255dd"
+database_name = "edge-blog"
+database_id = "ca004388-c926-44ea-8892-f2543c8742d7"
 
 # R2 — media library / image uploads
 [[r2_buckets]]
