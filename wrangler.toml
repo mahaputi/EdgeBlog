@@ -49,7 +49,7 @@ bucket_name = "edge-blog-media"
 # KV — config cache + rate limiting counters
 [[kv_namespaces]]
 binding = "CACHE"
-id = "17f2c666debb4590be75cfa7d8879ede"
+id = "912a15469fb145429ead3dfdd0d5f6ea"
 
 # Workers AI — default AI provider (no API key required inside the Worker)
 [ai]
