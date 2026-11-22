@@ -38,13 +38,13 @@ crons = ["*/5 * * * *"]
 # D1 — relational data (posts, comments, settings, ...)
 [[d1_databases]]
 binding = "DB"
-database_name = "edge-blog"
-database_id = "ca004388-c926-44ea-8892-f2543c8742d7"
+database_name = "putixin"
+database_id = "55d32fc6-a645-4c4a-80ae-03d0048a21a2"
 
 # R2 — media library / image uploads
 [[r2_buckets]]
 binding = "MEDIA"
-bucket_name = "edge-blog-media"
+bucket_name = "putixin"
 
 # KV — config cache + rate limiting counters
 [[kv_namespaces]]
