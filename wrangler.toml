@@ -1,6 +1,6 @@
 # Cloudflare Worker project configuration.
 # Docs: https://developers.cloudflare.com/workers/wrangler/configuration/
-name = "edge-blog"
+name = "putixin"
 compatibility_date = "2026-11-10"
 compatibility_flags = ["nodejs_compat"]
 
