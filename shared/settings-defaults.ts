@@ -218,6 +218,15 @@ export const WECHAT_DEFAULTS: WechatSettings = {
   author: '',
   openComment: false,
   onlyFansCanComment: false,
+  bodyCoverPosition: 'none',
+  repairPushFailures: true,
+  // 免费版 Worker 的 10ms CPU 跑不完 wasm 图片压缩，默认关闭；付费版再打开。
+  serverImageProcessing: false,
+  // 远程压缩接口：留空关闭。免费版可配它来替代 wasm（Worker 只做 I/O）。
+  imageCompressUrl: '',
+  imageCompressToken: '',
+  imageCompressField: 'file',
+  imageCompressParams: '',
   miniprogramEnabled: false,
   miniprogramAppId: '',
   miniprogramPath: '',

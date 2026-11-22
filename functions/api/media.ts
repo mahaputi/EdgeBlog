@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { MediaItem, MediaUsage } from '@shared/types';
 import { requireAuth } from '../lib/auth';
 import { hashIp } from '../lib/crypto';
-import { all, first, run } from '../lib/db';
+import { all, first, placeholders, run } from '../lib/db';
 import type { AppEnv } from '../lib/env';
 import { AppError } from '../lib/errors';
 import { hit } from '../lib/rate-limit';
@@ -11,6 +11,8 @@ import { created, ok } from '../lib/response';
 import { paginationSchema } from '../lib/validate';
 import { recordAudit } from '../lib/audit';
 import { mediaObjectKey, mediaPublicUrl } from '../lib/media-store';
+import { loadImageSource } from '../lib/media-ingest';
+import { mediaInUseSql, unusedMediaSummary } from '../lib/media-usage';
 import {
   EXT_BY_MIME,
   IMAGE_MAX_SIZE,
@@ -44,42 +46,188 @@ mediaRoutes.get('/', async (c) => {
       q: z.string().trim().max(100).optional(),
       /** Restrict the picker to images or videos. */
       kind: z.enum(['image', 'video']).optional(),
+      /** 媒体库筛选用：只看已使用 / 未使用的文件。 */
+      usage: z.enum(['used', 'unused']).optional(),
+      /** 传 `1` 才计算「是否使用」与未使用汇总；媒体选择器不需要，省一次全表扫描。 */
+      stats: z.literal('1').optional(),
     })
     .safeParse(c.req.query());
   if (!parsed.success) throw AppError.validation('查询参数校验失败', parsed.error.flatten());
-  const { page, perPage, q, kind } = parsed.data;
+  const { page, perPage, q, kind, usage, stats } = parsed.data;
   c.header('Cache-Control', 'no-store');
 
   const conditions: string[] = [];
   const binds: unknown[] = [];
   if (q) {
-    conditions.push('(filename LIKE ? OR key LIKE ?)');
-    binds.push(`%${q}%`, `%${q}%`);
+    // D1 的 LIKE pattern 上限 50 字节，长文件名/长关键词会直接报错，改用 instr。
+    conditions.push('(instr(lower(m.filename), lower(?)) > 0 OR instr(lower(m.key), lower(?)) > 0)');
+    binds.push(q, q);
   }
   if (kind) {
-    conditions.push('mime LIKE ?');
+    conditions.push('m.mime LIKE ?');
     binds.push(`${kind}/%`);
   }
-  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const whereWith = (extra: string | null) => {
+    const clauses = extra ? [...conditions, extra] : conditions;
+    return clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  };
 
-  const totalRow = await first<{ total: number }>(
+  const wantsUsage = stats === '1' || Boolean(usage);
+
+  /**
+   * 一次查询拿总数、未使用汇总与当前页数据。
+   *
+   * `sql` 为 null 时完全不引用判定条件——用于「使用状态统计失败」后的降级：
+   * 老库缺列/缺表时媒体列表仍要能用，只是不显示徽标。
+   */
+  const runList = async (sql: string | null) => {
+    const usageCondition = usage && sql ? (usage === 'used' ? sql : `NOT ${sql}`) : null;
+    const where = whereWith(usageCondition);
+    const [totalRow, summary, rows] = await Promise.all([
+      first<{ total: number }>(c.env, `SELECT COUNT(*) AS total FROM media m ${where}`, ...binds),
+      sql && stats === '1' ? unusedMediaSummary(c.env, sql) : Promise.resolve(null),
+      all<MediaItem>(
+        c.env,
+        `SELECT m.*${sql && stats === '1' ? `, CASE WHEN ${sql} THEN 1 ELSE 0 END AS in_use` : ''}
+           FROM media m ${where}
+          ORDER BY m.created_at DESC, m.id DESC
+          LIMIT ? OFFSET ?`,
+        ...binds,
+        perPage,
+        (page - 1) * perPage,
+      ),
+    ]);
+    return { total: totalRow?.total ?? 0, summary, rows };
+  };
+
+  const respond = (result: Awaited<ReturnType<typeof runList>>, usageError?: string) =>
+    ok(c, result.rows, {
+      page,
+      perPage,
+      total: result.total,
+      totalPages: Math.max(1, Math.ceil(result.total / perPage)),
+      ...(result.summary ? { unused: result.summary.count, unusedBytes: result.summary.bytes } : {}),
+      ...(usageError ? { usageError } : {}),
+    });
+
+  if (!wantsUsage) return respond(await runList(null));
+
+  // 「已使用 / 未使用」筛选与徽标依赖同一份判定 SQL；探测失败时降级。
+  let usageSql: string | null = null;
+  try {
+    usageSql = await mediaInUseSql(c.env);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[media] usage detection failed', err);
+    if (usage) throw AppError.internal(`媒体使用状态查询失败：${message}`);
+    return respond(await runList(null), message);
+  }
+
+  try {
+    return respond(await runList(usageSql));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[media] usage query failed', err);
+    // 用了「已使用 / 未使用」筛选时结果必须准确，不能降级成错误列表。
+    if (usage) throw AppError.internal(`媒体使用状态查询失败：${message}`);
+    return respond(await runList(null), message);
+  }
+});
+
+/**
+ * Admin: 取回一张图片的原始字节（文章编辑器推送前在浏览器里转码用）。
+ *
+ * 只做「读 R2 / 下载外链 + 原样返回」，**不解码也不压缩**：免费版 Worker 每个
+ * 请求只有 10ms CPU，这里必须是可以忽略的搬运工作。外链沿用
+ * `loadImageSource` 的 SSRF 防护与体积上限。
+ */
+mediaRoutes.get('/proxy', async (c) => {
+  const raw = (c.req.query('url') ?? '').trim();
+  if (!raw) throw AppError.badRequest('缺少 url 参数');
+  const isHttp = /^https?:\/\//i.test(raw);
+  const isLocal = raw.startsWith('/') && !raw.startsWith('//');
+  if (!isHttp && !isLocal) throw AppError.badRequest('url 必须是 http(s) 地址或站内 /media/ 路径');
+
+  const loaded = await loadImageSource(c.env, raw, {
+    maxSize: IMAGE_MAX_SIZE,
+    maxSizeMessage: '图片超过 8MB 限制',
+  });
+  return new Response(loaded.bytes, {
+    headers: {
+      'Content-Type': loaded.mime || 'application/octet-stream',
+      'Content-Length': String(loaded.bytes.byteLength),
+      'Cache-Control': 'private, max-age=600',
+      'X-Content-Type-Options': 'nosniff',
+    },
+  });
+});
+
+/**
+ * 清理未使用的媒体（分批）。
+ *
+ * 免费版每个请求最多 50 个子请求，而每删一个对象就是一次 R2 调用，所以单批
+ * 默认 20、上限 30，并返回 `remaining`，由前端循环调用直到清空。
+ * 判定口径与列表里的「未使用」完全一致（`MEDIA_IN_USE_SQL`）。
+ */
+mediaRoutes.post('/cleanup-unused', async (c) => {
+  const raw = Number.parseInt(c.req.query('limit') ?? '20', 10);
+  const limit = Number.isFinite(raw) ? Math.min(30, Math.max(1, raw)) : 20;
+
+  const usageSql = await mediaInUseSql(c.env).catch((err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[media] cleanup usage detection failed', err);
+    throw AppError.internal(`清理未使用媒体失败：${message}`);
+  });
+  const rows = await all<{ id: number; key: string; thumbnail_url: string | null; size: number }>(
     c.env,
-    `SELECT COUNT(*) AS total FROM media ${where}`,
-    ...binds,
-  );
-  const total = totalRow?.total ?? 0;
-  const rows = await all<MediaItem>(
+    `SELECT m.id, m.key, m.thumbnail_url, m.size
+       FROM media m
+      WHERE NOT ${usageSql}
+      ORDER BY m.created_at ASC, m.id ASC
+      LIMIT ?`,
+    limit,
+  ).catch((err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[media] cleanup query failed', err);
+    throw AppError.internal(`清理未使用媒体失败：${message}`);
+  });
+  if (rows.length === 0) {
+    return ok(c, { deleted: 0, remaining: 0, freedBytes: 0, keys: [] as string[] });
+  }
+
+  let freedBytes = 0;
+  for (const row of rows) {
+    // 先删对象再删索引：R2 失败就让整批失败，避免留下「有记录、无对象」的死链。
+    await c.env.MEDIA.delete(row.key);
+    if (row.thumbnail_url) {
+      const thumbKey = keyFromPublicUrl(row.thumbnail_url, c.env.MEDIA_PUBLIC_BASE ?? '');
+      if (thumbKey && thumbKey !== row.key) {
+        await c.env.MEDIA.delete(thumbKey).catch(() => undefined);
+      }
+    }
+    freedBytes += row.size;
+  }
+  await run(
     c.env,
-    `SELECT * FROM media ${where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
-    ...binds,
-    perPage,
-    (page - 1) * perPage,
+    `DELETE FROM media WHERE id IN (${placeholders(rows.length)})`,
+    ...rows.map((row) => row.id),
   );
-  return ok(c, rows, {
-    page,
-    perPage,
-    total,
-    totalPages: Math.max(1, Math.ceil(total / perPage)),
+
+  const summary = await unusedMediaSummary(c.env, usageSql).catch((err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[media] cleanup summary failed', err);
+    throw AppError.internal(`已清理 ${rows.length} 个文件，但统计剩余数量失败：${message}`);
+  });
+  await recordAudit(c.env, c.get('user'), 'media.cleanup', 'media', null, {
+    deleted: rows.length,
+    freedBytes,
+    keys: rows.slice(0, 10).map((row) => row.key),
+  });
+  return ok(c, {
+    deleted: rows.length,
+    remaining: summary.count,
+    freedBytes,
+    keys: rows.map((row) => row.key),
   });
 });
 
@@ -98,12 +246,12 @@ mediaRoutes.get('/:id/usage', async (c) => {
     c.env,
     `SELECT id, slug, title, status FROM posts
       WHERE deleted_at IS NULL
-        AND (cover_url = ? OR og_image = ? OR content_md LIKE ? OR content_md LIKE ?)
+        AND (cover_url = ? OR og_image = ? OR instr(content_md, ?) > 0 OR instr(content_md, ?) > 0)
       ORDER BY updated_at DESC LIMIT 50`,
     row.url,
     row.url,
-    `%${row.key}%`,
-    `%${row.url}%`,
+    row.key,
+    row.url,
   );
   return ok(c, rows);
 });

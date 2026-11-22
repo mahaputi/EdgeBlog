@@ -2,9 +2,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { WechatSettings } from '../shared/types';
 import type { Env } from '../functions/lib/env';
 import { AppError } from '../functions/lib/errors';
-import { renderWechatContent, renderMiniprogramCard, substituteWechatImages, truncateChars, validateWechatContent } from '../functions/lib/wechat-render';
+import { insertBodyCover, renderWechatContent, renderMiniprogramCard, substituteWechatImages, truncateChars, validateWechatContent } from '../functions/lib/wechat-render';
 import { validateWechatContentImage } from '../functions/lib/wechat-draft';
 import { addDraft, type WechatArticle } from '../functions/lib/wechat';
+import { Deadline } from '../functions/lib/deadline';
 
 const SETTINGS: WechatSettings = {
   enabled: true,
@@ -13,6 +14,13 @@ const SETTINGS: WechatSettings = {
   author: '测试作者',
   openComment: false,
   onlyFansCanComment: false,
+  bodyCoverPosition: 'none',
+  repairPushFailures: true,
+  serverImageProcessing: true,
+  imageCompressUrl: '',
+  imageCompressToken: '',
+  imageCompressField: 'file',
+  imageCompressParams: '',
   miniprogramEnabled: false,
   miniprogramAppId: '',
   miniprogramPath: '',
@@ -82,6 +90,17 @@ describe('WeChat Markdown rendering', () => {
     expect(rendered.html).toContain('<li style=');
     expect(truncateChars('甲😀乙', 2)).toBe('甲😀');
     expect(truncateChars('abc', 4)).toBe('abc');
+  });
+
+  it('inserts a body cover at the requested position', () => {
+    const html = '<p>第一段</p><p>第二段</p><p>第三段</p>';
+    const cover = '<p>封面</p>';
+
+    expect(insertBodyCover(html, cover, 'top')).toBe(`${cover}${html}`);
+    expect(insertBodyCover(html, cover, 'bottom')).toBe(`${html}${cover}`);
+    expect(insertBodyCover(html, cover, 'middle')).toContain('</p><p>封面</p><p>');
+    expect(insertBodyCover('plain text', cover, 'middle')).toBe(`${cover}plain text`);
+    expect(insertBodyCover(html, cover, 'none')).toBe(html);
   });
 
   it('enforces strict HTML character and byte limits', () => {
@@ -198,5 +217,23 @@ describe('WeChat API client', () => {
       expect((err as Error).message).not.toContain(SETTINGS.appSecret);
     }
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('响应体迟迟不发完时也会超时，而不是一直挂着', async () => {
+    const { env } = createEnv();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/cgi-bin/stable_token')) {
+        return jsonResponse({ access_token: 'token', expires_in: 7200 });
+      }
+      // 响应头已返回，但 body 永远不结束：只包 fetch 的实现会在这里挂死。
+      return new Response(new ReadableStream({ start() {} }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(addDraft(env, SETTINGS, ARTICLE, new Deadline(80))).rejects.toThrow(/超时/);
   });
 });

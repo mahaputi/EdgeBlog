@@ -28,6 +28,71 @@ export interface ApiResult<T> {
 
 type Method = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 
+/** 普通请求的超时上限（毫秒）。 */
+const DEFAULT_TIMEOUT_MS = 30_000;
+
+/** 媒体上传（可能是几十 MB 的视频）的超时上限。 */
+const UPLOAD_TIMEOUT_MS = 300_000;
+
+/**
+ * 按路径判定长耗时接口的超时上限。
+ *
+ * 这些接口在服务端要串行做多次外部调用（AI 生成、公众号推送、定时任务执行），
+ * 30 秒必然不够；但也不能不设上限——请求挂死时界面会一直转圈。取值都比服务端
+ * 自己的预算略大，让服务端先返回明确的错误，而不是前端先掐断。
+ */
+function timeoutForPath(path: string): number {
+  // 公众号推送：服务端整条推送预算 100 秒（见 WECHAT_PUSH_BUDGET_MS）。
+  if (path.startsWith('/wechat/posts/') && path.endsWith('/draft')) return 130_000;
+  // AI 生成的单次请求上限由「AI 设置」控制（默认 5 分钟）。
+  if (path === '/ai/generate' || path === '/ai/chat') return 330_000;
+  // 手动执行定时任务：正文 6 分钟 + 封面 3 分钟 + 推送。
+  if (/^\/automation\/\d+\/run$/.test(path)) return 660_000;
+  return DEFAULT_TIMEOUT_MS;
+}
+
+/** 把超时归一成可读的 ApiError，避免界面一直转圈。 */
+function timeoutError(ms: number): ApiError {
+  const seconds = Math.round(ms / 1000);
+  return new ApiError(0, 'TIMEOUT', `请求超时（已等待 ${seconds} 秒），请稍后重试`);
+}
+
+/**
+ * 非 JSON 响应的可读描述。
+ *
+ * API 自身出错一定会走 `fail()` 返回 JSON 信封；拿不到 JSON 说明响应来自边缘
+ * 而不是应用代码（HTTP/2 下 `statusText` 还是空字符串，只显示「请求失败」根本
+ * 没法定位）。这里把状态码、边缘错误码和正文片段带出来，尤其要点明
+ * `Error 1102`：免费版 Worker 的 CPU 上限只有 10ms，图片压缩这类 wasm 计算
+ * 必然被终止，看起来就是「点了没反应/请求失败」。
+ */
+function describeNonJsonResponse(res: Response, text: string): string {
+  const marker = /Error\s*(\d{4})[^<]*/i.exec(text);
+  if (marker) {
+    const code = marker[1];
+    if (code === '1102') {
+      return '边缘返回 Error 1102：Worker 超出资源限制（免费版 CPU 上限 10ms，图片压缩等重计算跑不完），请检查 Workers 计划或改为在浏览器侧压缩图片';
+    }
+    if (code === '1101') {
+      return '边缘返回 Error 1101：Worker 抛出了未捕获的异常，请查看 Workers 实时日志';
+    }
+    return `边缘返回 Error ${code}：${marker[0].slice(0, 120)}`;
+  }
+  if (res.status === 524) {
+    return '边缘等待超时（HTTP 524）：服务端在 Cloudflare 的代理读超时内没有返回';
+  }
+  if (res.status === 502 || res.status === 503) {
+    return `边缘无法连接 Worker（HTTP ${res.status}）`;
+  }
+  const snippet = text
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
+  const base = `服务器返回了非 JSON 响应（HTTP ${res.status}）`;
+  return snippet ? `${base}：${snippet}` : base;
+}
+
 /**
  * Called when a request that needed a session came back 401 (expired cookie,
  * revoked session after a password change on another device, …). AuthProvider
@@ -43,15 +108,37 @@ export function setUnauthorizedHandler(handler: ((error: ApiError) => void) | nu
 /** Endpoints where a 401 is an expected answer, not a lost session. */
 const AUTH_PROBES = new Set(['/auth/me', '/auth/login']);
 
-async function request<T>(method: Method, path: string, body?: unknown): Promise<ApiResult<T>> {
-  const res = await fetch(`/api${path}`, {
-    method,
-    credentials: 'same-origin',
-    headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
+async function request<T>(
+  method: Method,
+  path: string,
+  body?: unknown,
+  timeoutMs = timeoutForPath(path),
+): Promise<ApiResult<T>> {
+  // 超时同时管住连接与读取响应体：只包 fetch 时，服务端迟迟不结束响应
+  // 会让 `res.text()` 一直挂着。
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
 
-  const text = await res.text();
+  let res: Response;
+  let text: string;
+  try {
+    res = await fetch(`/api${path}`, {
+      method,
+      credentials: 'same-origin',
+      headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: controller.signal,
+    });
+    text = await res.text();
+  } catch (err) {
+    if (controller.signal.aborted) throw timeoutError(timeoutMs);
+    throw err instanceof Error
+      ? new ApiError(0, 'NETWORK_ERROR', err.message || '网络请求失败')
+      : new ApiError(0, 'NETWORK_ERROR', '网络请求失败');
+  } finally {
+    window.clearTimeout(timer);
+  }
+
   let json: ApiResponse<T> | null = null;
   if (text) {
     try {
@@ -65,7 +152,7 @@ async function request<T>(method: Method, path: string, body?: unknown): Promise
     const error =
       json && json.ok === false
         ? json.error
-        : { code: `HTTP_${res.status}`, message: res.statusText || '请求失败' };
+        : { code: `HTTP_${res.status}`, message: describeNonJsonResponse(res, text) };
     const apiError = new ApiError(res.status, error.code, error.message, error.details);
     if (apiError.status === 401 && !AUTH_PROBES.has(path)) {
       unauthorizedHandler?.(apiError);
@@ -93,12 +180,28 @@ export async function uploadMedia(file: File): Promise<import('@shared/types').M
     const thumbnail = await captureVideoThumbnail(file);
     if (thumbnail) form.append('thumbnail', thumbnail);
   }
-  const res = await fetch('/api/media/upload', {
-    method: 'POST',
-    credentials: 'same-origin',
-    body: form,
-  });
-  const json = (await res.json()) as ApiResponse<import('@shared/types').MediaItem>;
+  // 视频文件可达数十 MB，给足时间，但不留「永远等下去」的可能。
+  const ms = UPLOAD_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), ms);
+  let res: Response;
+  let json: ApiResponse<import('@shared/types').MediaItem>;
+  try {
+    res = await fetch('/api/media/upload', {
+      method: 'POST',
+      credentials: 'same-origin',
+      body: form,
+      signal: controller.signal,
+    });
+    json = (await res.json()) as ApiResponse<import('@shared/types').MediaItem>;
+  } catch (err) {
+    if (controller.signal.aborted) throw timeoutError(ms);
+    throw err instanceof Error
+      ? new ApiError(0, 'NETWORK_ERROR', err.message || '上传失败')
+      : new ApiError(0, 'NETWORK_ERROR', '上传失败');
+  } finally {
+    window.clearTimeout(timer);
+  }
   if (!json.ok) throw new ApiError(res.status, json.error.code, json.error.message, json.error.details);
   return json.data;
 }

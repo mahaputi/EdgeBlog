@@ -180,6 +180,19 @@ export interface MediaItem {
   /** 视频封面图地址（上传时由首帧生成）；旧数据或图片为 null。 */
   thumbnail_url: string | null;
   created_at: string;
+  /**
+   * 是否正被文章 / 专栏 / 定时任务 / 设置引用（列表接口计算，1 = 已使用）。
+   * 单条接口（上传、删除）不会带这个字段。
+   */
+  in_use?: number;
+}
+
+/** 一次「清理未使用媒体」的结果（接口按批删除，前端循环调用直到 remaining = 0）。 */
+export interface MediaCleanupResult {
+  deleted: number;
+  remaining: number;
+  freedBytes: number;
+  keys: string[];
 }
 
 /** A post that references a media object — used before deleting an image. */
@@ -633,6 +646,43 @@ export interface WechatSettings {
   openComment: boolean;
   /** 是否仅粉丝可评论（only_fans_can_comment），仅 openComment 为真时生效。 */
   onlyFansCanComment: boolean;
+  /** 推送到公众号时，封面图在正文中的位置；不插入时仍作为公众号封面。 */
+  bodyCoverPosition: 'none' | 'top' | 'middle' | 'bottom';
+  /** 推送因图片格式/体积失败时，是否让 AI 自动压缩或转换后重试一次。 */
+  repairPushFailures: boolean;
+  /**
+   * 是否允许 Worker 在推送时解码/压缩图片。
+   *
+   * 需要 Workers 付费版：免费版每个请求只有 **10ms CPU**，wasm 解码/编码一张
+   * 图就要 100ms 以上，请求会被边缘直接终止（Error 1102），前端只能看到
+   * 「请求失败」。关闭时推送只按文件头/体积做校验，需要转换的图片带图名报错，
+   * 由文章编辑器在浏览器侧（Canvas）先转成微信能接收的 jpg/png。
+   */
+  serverImageProcessing: boolean;
+  /**
+   * 远程图片压缩接口地址；留空表示不启用。
+   *
+   * Worker 只做「POST 文件 → 收二进制」这一层 I/O，不消耗 CPU，所以免费版也能用。
+   * 按 uapis.cn `/api/v1/image/compress` 的约定实现：multipart 字段 `file`；
+   * 输出格式/压缩等级等参数请直接拼在地址上（如 `?format=jpeg&level=1`），
+   * 代码不会自动追加。接口没有宽高/目标体积参数，输出仍会按微信限制重新校验，
+   * 不达标就指名报错。
+   */
+  imageCompressUrl: string;
+  /** 远程压缩接口的 API Key（仅存服务端），留空则匿名调用。 */
+  imageCompressToken: string;
+  /**
+   * multipart 上传时的文件字段名，默认 `file`。
+   * 例：uapis.cn 用 `file`，compress.scdn.io 用 `image`。
+   */
+  imageCompressField: string;
+  /**
+   * 额外的表单字段（URL 编码形式，如 `quality=70&outputFormat=jpeg&response=binary`）。
+   *
+   * 不同接口对参数位置要求不同：uapis 走查询参数（拼在 URL 上），scdn 走表单字段。
+   * 这里统一按表单字段追加，留空则不传。
+   */
+  imageCompressParams: string;
   /** 是否在每篇推送文章末尾追加「小程序卡片」。 */
   miniprogramEnabled: boolean;
   /** 卡片跳转的小程序 AppID。 */
@@ -650,13 +700,51 @@ export interface WechatSettings {
 }
 
 /** WeChat settings safe to return to the admin UI (secret replaced by a flag). */
-export type WechatSettingsView = Omit<WechatSettings, 'appSecret'> & {
+export type WechatSettingsView = Omit<WechatSettings, 'appSecret' | 'imageCompressToken'> & {
   hasAppSecret: boolean;
+  /** 已保存远程压缩接口的 API Key（不回显明文）。 */
+  hasImageCompressToken: boolean;
   /** AppID 与 AppSecret 均已填写。 */
   configured: boolean;
 };
 
-/** 一次草稿推送的结果（后台按钮与定时任务的返回值）。 */
+/**
+ * 公众号正文长度预检结果。
+ *
+ * 微信 `draft/add` 的 `content` 限制是「必须少于 2 万字符且小于 1M」,统计的是
+ * **渲染后的 HTML 字符串**(含标签与 `style` 属性),不是 Markdown 字符数。
+ * 这个结构同时供编辑器实时预检与 AI 的 `count_chars` 工具使用,保证两边口径一致。
+ */
+export interface WechatLengthReport {
+  /** 推送时 content 的字符数(图片地址按典型 mmbiz URL 长度估算)。 */
+  chars: number;
+  /** 同上但图片地址按占位符计,是理论下限。 */
+  charsMin: number;
+  /** 推送时 content 的 UTF-8 字节数(含图片地址估算)。 */
+  bytes: number;
+  limitChars: number;
+  limitBytes: number;
+  /** 超过 2 万字符的字数,未超为 0。 */
+  overChars: number;
+  /** 是否在微信限制内。 */
+  ok: boolean;
+  /** 正文图片张数(含正文封面与小程序卡片配图)。 */
+  imageCount: number;
+  /** 每张图片地址按多少字符估算。 */
+  imageUrlChars: number;
+  /** 原文 Markdown 字符数(仅供参考,微信不按这个算)。 */
+  markdownChars: number;
+  /** 去掉所有标签后的可见文字字符数。 */
+  visibleChars: number;
+  /** 所有 `style="..."` 属性合计字符数,通常是最主要的开销。 */
+  styleChars: number;
+  /** 文末小程序卡片占用的字符数,未启用为 0。 */
+  cardChars: number;
+  /** 与推送时完全一致的超限提示,未超为 null。 */
+  error: string | null;
+}
+
+/** 一次草稿推送的结果(后台按钮与定时任务的返回值)。 */
 export interface WechatPushResult {
   /** 新草稿 media_id，或更新既有草稿时为 null。 */
   mediaId: string | null;
@@ -717,6 +805,11 @@ export interface ApiMeta {
   perPage?: number;
   total?: number;
   totalPages?: number;
+  /** 媒体库列表专用：当前未使用的文件数与占用字节（不受分页/筛选影响）。 */
+  unused?: number;
+  unusedBytes?: number;
+  /** 使用状态统计失败时的原始错误（媒体库会显示提示；筛选/清理仍按准确口径拒绝）。 */
+  usageError?: string;
 }
 
 export type ApiSuccess<T> = { ok: true; data: T; meta?: ApiMeta };

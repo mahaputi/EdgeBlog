@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import type { ApiMeta, AuditLogEntry } from '@shared/types';
 import { Input, Select } from '../../components/ui/Field';
-import { Card, EmptyState, Skeleton } from '../../components/ui/Feedback';
+import { EmptyState, Skeleton } from '../../components/ui/Feedback';
+import { Section } from '../../components/ui/Section';
 import { Pagination } from '../../components/ui/Pagination';
 import { api, qs } from '../../lib/api';
 import { formatDateTime } from '../../lib/format';
@@ -33,6 +34,7 @@ const ACTION_LABELS: Record<string, string> = {
   'comment.batch.spam': '批量标记垃圾',
   'comment.batch.delete': '批量删除评论',
   'media.delete': '删除媒体',
+  'media.cleanup': '清理未使用媒体',
   'tag.create': '创建标签',
   'tag.update': '更新标签',
   'tag.delete': '删除标签',
@@ -116,7 +118,7 @@ export function AuditLogPage() {
       ) : visible.length === 0 ? (
         <EmptyState icon="clock" title="没有记录" description="还没有符合条件的管理操作。" />
       ) : (
-        <Card className="overflow-hidden">
+        <Section title="日志明细" description="按时间倒序，每页 30 条。" icon="clock" bodyClassName="p-0">
           <div className="overflow-x-auto">
             <table className="w-full min-w-[720px] text-sm">
               <thead>
@@ -164,7 +166,7 @@ export function AuditLogPage() {
               </tbody>
             </table>
           </div>
-        </Card>
+        </Section>
       )}
 
       <Pagination

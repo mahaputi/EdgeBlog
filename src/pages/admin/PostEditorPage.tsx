@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import type { AiSettingsView, ColumnSummary, MediaItem, PostDetail, PostStatus, WechatSettingsView } from '@shared/types';
+import type { AiSettingsView, ColumnSummary, MediaItem, PostDetail, PostStatus, WechatLengthReport, WechatSettingsView } from '@shared/types';
 import { ApiError, api } from '../../lib/api';
+import { prepareWechatAssets } from '../../lib/wechat-prepare';
 import { parseSqlDate } from '../../lib/format';
 import { useAsync, useDocumentTitle, useUnsavedChangesGuard } from '../../hooks';
 import { useSettings } from '../../providers/SettingsProvider';
@@ -9,7 +10,8 @@ import { useToast } from '../../providers/ToastProvider';
 import { Button } from '../../components/ui/Button';
 import { Input, Select, Textarea } from '../../components/ui/Field';
 import { Switch } from '../../components/ui/Switch';
-import { Card, Centered, Spinner } from '../../components/ui/Feedback';
+import { Centered, Spinner } from '../../components/ui/Feedback';
+import { Section } from '../../components/ui/Section';
 import { Icon } from '../../components/ui/icons';
 import { MediaPicker } from '../../components/admin/MediaPicker';
 import { MarkdownEditor } from '../../components/admin/MarkdownEditor';
@@ -102,11 +104,19 @@ export function PostEditorPage() {
   const [aiBusy, setAiBusy] = useState<null | 'excerpt' | 'content'>(null);
   const [wechatReady, setWechatReady] = useState(false);
   const [wechatPushing, setWechatPushing] = useState(false);
+  const [wechatLength, setWechatLength] = useState<WechatLengthReport | null>(null);
 
   const draftKey = `${DRAFT_PREFIX}${routeSlug ?? 'new'}`;
   const [baseline, setBaseline] = useState<string>(() => JSON.stringify(EMPTY));
   const [stashed, setStashed] = useState<FormState | null>(null);
   const dirty = loaded && JSON.stringify(form) !== baseline;
+
+  // 异步回调（公众号推送失败后服务端自动修图）需要读到最新表单值再合并，
+  // 不能用闭包里可能已经过期的 form。
+  const formRef = useRef(form);
+  useEffect(() => {
+    formRef.current = form;
+  }, [form]);
 
   // Stashes are tagged with the tab that wrote them: a second, clean editor tab
   // must never wipe another tab's unsaved work.
@@ -190,6 +200,33 @@ export function PostEditorPage() {
     };
   }, []);
 
+  // 公众号正文长度预检:微信「2 万字符」统计的是渲染后的 HTML,和 Markdown
+  // 字数差好几倍,所以输入停顿后按推送同一套逻辑算一遍,提前暴露超限。
+  useEffect(() => {
+    if (!wechatReady) {
+      setWechatLength(null);
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      api
+        .post<WechatLengthReport>('/wechat/preflight', {
+          contentMd: form.contentMd,
+          coverUrl: form.coverUrl.trim() || null,
+        })
+        .then(({ data }) => {
+          if (!cancelled) setWechatLength(data);
+        })
+        .catch(() => {
+          if (!cancelled) setWechatLength(null);
+        });
+    }, 800);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [wechatReady, form.contentMd, form.coverUrl]);
+
   // 专栏列表（含隐藏专栏）：文章可以发到隐藏专栏，编辑时也要能选回原专栏。
   const columns = useAsync(
     () => api.get<ColumnSummary[]>('/columns/admin').then((r) => r.data).catch(() => [] as ColumnSummary[]),
@@ -250,6 +287,32 @@ export function PostEditorPage() {
     }
   };
 
+  /**
+   * 与「保存」完全一致的请求体。
+   *
+   * 推送前会用它把浏览器侧转换后的正文/封面一起落库，避免两处字段清单漂移
+   * （例如新增了 featured/pinned 之类的字段只改一处）。
+   */
+  const buildPayload = (contentMd: string, coverUrl: string) => ({
+    title: form.title.trim(),
+    slug: form.slug.trim() || undefined,
+    excerpt: form.excerpt.trim(),
+    contentMd,
+    coverUrl: coverUrl.trim() || null,
+    status: form.status,
+    publishedAt: form.publishedAt ? new Date(form.publishedAt).toISOString() : null,
+    metaTitle: form.metaTitle.trim() || null,
+    metaDescription: form.metaDescription.trim() || null,
+    ogImage: form.ogImage.trim() || null,
+    featured: form.featured,
+    tags: form.tags
+      .split(',')
+      .map((t) => t.trim())
+      .filter(Boolean),
+    // '' 表示博客文章，后端把它当成 null。
+    columnId: form.columnId ? Number(form.columnId) : null,
+  });
+
   const pushToWechat = async () => {
     if (!editing || !postId) {
       error('请先保存文章，再推送到公众号草稿');
@@ -265,32 +328,43 @@ export function PostEditorPage() {
     }
     setWechatPushing(true);
     try {
-      // 推送接口按文章 ID 从库里读取，先把未保存的修改落库，避免推旧内容。
-      if (dirty) {
-        await api.put<PostDetail>(`/posts/${postId}`, {
-          title: form.title.trim(),
-          slug: form.slug.trim() || undefined,
-          excerpt: form.excerpt.trim(),
-          contentMd: form.contentMd,
-          coverUrl: form.coverUrl.trim() || null,
-          status: form.status,
-          publishedAt: form.publishedAt ? new Date(form.publishedAt).toISOString() : null,
-          metaTitle: form.metaTitle.trim() || null,
-          metaDescription: form.metaDescription.trim() || null,
-          ogImage: form.ogImage.trim() || null,
-          featured: form.featured,
-          tags: form.tags.split(',').map((t) => t.trim()).filter(Boolean),
-          columnId: form.columnId ? Number(form.columnId) : null,
-        });
-        setBaseline(JSON.stringify(form));
+      // 免费版 Worker 只有 10ms CPU，服务端 wasm 转图会被边缘终止（Error 1102）。
+      // 所以先在浏览器里把封面/正文图转成微信能直接接收的 jpg，再落库、推送。
+      const prepared = await prepareWechatAssets({
+        contentMd: form.contentMd,
+        coverUrl: form.coverUrl.trim(),
+      });
+      // 推送接口按文章 ID 从库里读取，先把未保存的修改（或转换结果）落库。
+      if (dirty || prepared.changed) {
+        await api.put<PostDetail>(`/posts/${postId}`, buildPayload(prepared.contentMd, prepared.coverUrl));
+        const next = { ...formRef.current, contentMd: prepared.contentMd, coverUrl: prepared.coverUrl };
+        formRef.current = next;
+        setForm(next);
+        setBaseline(JSON.stringify(next));
       }
-      const { data } = await api.post<{ updated: boolean; imageCount: number }>(
-        `/wechat/posts/${postId}/draft`,
-      );
+      const { data } = await api.post<{
+        updated: boolean;
+        imageCount: number;
+        repaired: boolean;
+        contentMd?: string;
+        coverUrl?: string | null;
+      }>(`/wechat/posts/${postId}/draft`);
+      // 服务端自动修复过图片时会改写正文/封面地址，必须同步回编辑器，
+      // 否则下一次保存会把修复前的旧图地址覆盖回去，推送又失败。
+      if (data.repaired && data.contentMd !== undefined) {
+        const next = { ...formRef.current, contentMd: data.contentMd, coverUrl: data.coverUrl ?? '' };
+        formRef.current = next;
+        setForm(next);
+        setBaseline(JSON.stringify(next));
+      }
+      const fixed = data.repaired ? '，图片已自动修复' : '';
+      const skipped = prepared.warnings.length
+        ? `；${prepared.warnings.length} 张图片未能在浏览器侧转换`
+        : '';
       success(
         data.updated
-          ? `已更新公众号草稿（同步 ${data.imageCount} 张正文图）`
-          : `已推送到公众号草稿（同步 ${data.imageCount} 张正文图）`,
+          ? `已更新公众号草稿（同步 ${data.imageCount} 张正文图${fixed}${skipped}）`
+          : `已推送到公众号草稿（同步 ${data.imageCount} 张正文图${fixed}${skipped}）`,
       );
     } catch (err) {
       error(err instanceof ApiError ? err.message : '推送失败');
@@ -311,25 +385,7 @@ export function PostEditorPage() {
     }
     setSaving(true);
     try {
-      const payload = {
-        title: form.title.trim(),
-        slug: form.slug.trim() || undefined,
-        excerpt: form.excerpt.trim(),
-        contentMd: form.contentMd,
-        coverUrl: form.coverUrl.trim() || null,
-        status: form.status,
-        publishedAt: form.publishedAt ? new Date(form.publishedAt).toISOString() : null,
-        metaTitle: form.metaTitle.trim() || null,
-        metaDescription: form.metaDescription.trim() || null,
-        ogImage: form.ogImage.trim() || null,
-        featured: form.featured,
-        tags: form.tags
-          .split(',')
-          .map((t) => t.trim())
-          .filter(Boolean),
-        // '' 表示博客文章，后端把它当成 null。
-        columnId: form.columnId ? Number(form.columnId) : null,
-      };
+      const payload = buildPayload(form.contentMd, form.coverUrl);
 
       if (editing && postId) {
         await api.put<PostDetail>(`/posts/${postId}`, payload);
@@ -426,6 +482,20 @@ export function PostEditorPage() {
               未保存
             </span>
           )}
+          {wechatReady && wechatLength && (
+            <span
+              className={`hidden items-center gap-1.5 text-xs sm:inline-flex ${
+                wechatLength.ok ? 'text-faint' : 'text-danger'
+              }`}
+              title={`公众号正文 ${wechatLength.chars} 字符(上限 ${wechatLength.limitChars},原文 Markdown ${wechatLength.markdownChars} 字符);可见文字 ${wechatLength.visibleChars} 字符,标签与样式占 ${wechatLength.chars - wechatLength.visibleChars} 字符`}
+            >
+              <Icon name={wechatLength.ok ? 'globe' : 'alert'} size={13} />
+              <span>
+                公众号 {wechatLength.chars} / {wechatLength.limitChars} 字符
+                {wechatLength.ok ? '' : `(需删减 ${wechatLength.overChars})`}
+              </span>
+            </span>
+          )}
           {editing && wechatReady && (
             <Button
               type="button"
@@ -464,7 +534,7 @@ export function PostEditorPage() {
         </div>
 
         <aside className="space-y-4">
-          <Card className="space-y-4 p-4">
+          <Section title="发布设置" description="决定文章出现在哪里、何时上线。" icon="upload">
             <Select
               label="发布到"
               value={form.columnId}
@@ -503,9 +573,9 @@ export function PostEditorPage() {
                 description="显示在首页精选模块"
               />
             )}
-          </Card>
+          </Section>
 
-          <Card className="space-y-4 p-4">
+          <Section title="文章信息" description="Slug、摘要和标签。" icon="fileText">
             <Input
               label="Slug"
               value={form.slug}
@@ -547,11 +617,10 @@ export function PostEditorPage() {
             {inColumn && (
               <p className="text-xs text-faint">专栏文章不参与标签体系；发布到博客后才可以加标签。</p>
             )}
-          </Card>
+          </Section>
 
-          <Card className="space-y-4 p-4">
+          <Section title="封面图" description="用于列表卡片与分享缩略图。" icon="image">
             <div className="flex flex-col gap-2">
-              <span className="text-sm font-medium text-fg">封面图</span>
               {form.coverUrl && (
                 <img src={form.coverUrl} alt="封面预览" className="aspect-video w-full rounded-xl object-cover ring-1 ring-fg/10" />
               )}
@@ -567,9 +636,9 @@ export function PostEditorPage() {
                 </Button>
               </div>
             </div>
-          </Card>
+          </Section>
 
-          <Card className="space-y-4 p-4">
+          <Section title="SEO 与分享" description="搜索引擎与社交平台读取的标题、描述和图片。" icon="search">
             <Input label="SEO 标题" value={form.metaTitle} onChange={(e) => set('metaTitle', e.target.value)} placeholder="留空使用文章标题" />
             <Textarea
               label="SEO 描述"
@@ -587,7 +656,7 @@ export function PostEditorPage() {
                 </Button>
               </div>
             </div>
-          </Card>
+          </Section>
         </aside>
       </div>
 

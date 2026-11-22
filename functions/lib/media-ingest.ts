@@ -14,12 +14,23 @@ import {
   THUMBNAIL_MAX_SIZE,
   VIDEO_MAX_SIZE,
   isVideoMime,
+  keyFromPublicUrl,
   sniffImageMime,
   sniffMediaMime,
 } from './media-file';
 import { mediaObjectKey, mediaPublicUrl } from './media-store';
+import { isAbortError, withTimeout } from './deadline';
 
 export const REMOTE_FETCH_TIMEOUT_MS = 30_000;
+
+/** 下载可选参数：`timeoutMs` 覆盖默认值（调用方按剩余预算收窄）。 */
+export interface DownloadOptions {
+  imageOnly?: boolean;
+  maxSize?: number;
+  maxSizeMessage?: string;
+  /** 本次下载的总超时（覆盖 `REMOTE_FETCH_TIMEOUT_MS`）。 */
+  timeoutMs?: number;
+}
 
 export interface DownloadedMedia {
   bytes: Uint8Array;
@@ -71,39 +82,44 @@ export function assertRemoteUrl(raw: string, label = '媒体地址'): URL {
 
 export async function downloadRemote(
   rawUrl: string,
-  opts: { imageOnly?: boolean; maxSize?: number; maxSizeMessage?: string } = {},
+  opts: DownloadOptions = {},
 ): Promise<DownloadedMedia> {
   const url = assertRemoteUrl(rawUrl);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REMOTE_FETCH_TIMEOUT_MS);
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      signal: controller.signal,
-      redirect: 'follow',
-      headers: { 'user-agent': 'EdgeBlog-AI/1.0' },
-    });
-  } catch (err) {
-    throw AppError.upstream(
-      err instanceof Error && err.name === 'AbortError'
-        ? '下载媒体超时,请稍后重试'
-        : '无法下载媒体,请检查地址是否可访问',
-    );
-  } finally {
-    clearTimeout(timer);
-  }
-  if (!response.ok) throw AppError.upstream(`下载媒体失败(HTTP ${response.status})`);
-  // `fetch` follows redirects; re-check the final host so a public URL cannot
-  // bounce the request into the private network.
-  if (response.url) {
-    try {
-      if (isPrivateHost(new URL(response.url).hostname)) {
-        throw AppError.badRequest('不允许从内网地址下载媒体');
+  const timeoutMs = opts.timeoutMs ?? REMOTE_FETCH_TIMEOUT_MS;
+  const timeoutMessage = '下载媒体超时,请稍后重试';
+
+  // fetch 与读取响应体共用同一个超时窗口:只包 fetch 时,对方发完响应头
+  // 不再发 body 会让 `arrayBuffer()` 一直挂着。
+  const { response, bytes } = await withTimeout(
+    async (signal) => {
+      let res: Response;
+      try {
+        res = await fetch(url, {
+          signal,
+          redirect: 'follow',
+          headers: { 'user-agent': 'EdgeBlog-AI/1.0' },
+        });
+      } catch (err) {
+        if (isAbortError(err)) throw err;
+        throw AppError.upstream('无法下载媒体,请检查地址是否可访问');
       }
-    } catch (err) {
-      if (err instanceof AppError) throw err;
-    }
-  }
+      if (!res.ok) throw AppError.upstream(`下载媒体失败(HTTP ${res.status})`);
+      // `fetch` follows redirects; re-check the final host so a public URL cannot
+      // bounce the request into the private network.
+      if (res.url) {
+        try {
+          if (isPrivateHost(new URL(res.url).hostname)) {
+            throw AppError.badRequest('不允许从内网地址下载媒体');
+          }
+        } catch (err) {
+          if (err instanceof AppError) throw err;
+        }
+      }
+      return { response: res, bytes: new Uint8Array(await res.arrayBuffer()) };
+    },
+    timeoutMs,
+    timeoutMessage,
+  );
 
   const maxSize = opts.maxSize ?? (opts.imageOnly ? THUMBNAIL_MAX_SIZE : VIDEO_MAX_SIZE);
   const maxSizeMessage = opts.maxSizeMessage ?? (opts.imageOnly ? '封面图超过 2MB 限制' : '媒体文件超过 25MB 限制');
@@ -112,7 +128,6 @@ export async function downloadRemote(
     throw AppError.payloadTooLarge(maxSizeMessage);
   }
 
-  const bytes = new Uint8Array(await response.arrayBuffer());
   if (bytes.byteLength === 0) throw AppError.badRequest('下载到的文件为空');
   if (bytes.byteLength > maxSize) {
     throw AppError.payloadTooLarge(maxSizeMessage);
@@ -147,26 +162,63 @@ export interface IngestedImage {
   size: number;
 }
 
-/**
- * 从公网 URL 下载一张图片,存入 R2 并写入 `media` 表,返回入库结果。
- *
- * 与「从 URL 上传媒体」工具走同一条链路,但只接受图片、上限为图片档位,
- * 供定时发文的封面外链入库与 AI 助手配图复用。
- */
-export async function ingestRemoteImage(
-  env: Env,
-  rawUrl: string,
-  filenameHint = 'image',
-): Promise<IngestedImage> {
-  const media = await downloadRemote(rawUrl);
-  if (isVideoMime(media.mime)) throw AppError.unsupportedMedia('封面必须是图片');
-  if (media.bytes.byteLength > IMAGE_MAX_SIZE) throw AppError.payloadTooLarge('图片超过 8MB 限制');
+export interface ImageSource {
+  bytes: Uint8Array;
+  mime: string;
+  filename: string;
+}
 
-  const filename = filenameFromUrl(rawUrl) || filenameHint;
-  const key = mediaObjectKey(filename, media.mime);
-  await env.MEDIA.put(key, media.bytes, {
+/**
+ * 读取一张图片的字节：本站 `/media/...` 直接读 R2（不绕回自家域名），
+ * 外链走带 SSRF 防护与体积上限的下载。
+ *
+ * 公众号推送、压缩工具、格式转换共用这一条链路，避免各写一套。
+ */
+export async function loadImageSource(
+  env: Env,
+  url: string,
+  opts: { maxSize?: number; maxSizeMessage?: string; timeoutMs?: number } = {},
+): Promise<ImageSource> {
+  const raw = url.trim();
+  if (!raw) throw AppError.badRequest('图片地址为空');
+  const maxSize = opts.maxSize ?? IMAGE_MAX_SIZE;
+  const maxSizeMessage = opts.maxSizeMessage ?? '图片超过 8MB 限制';
+
+  if (raw.startsWith('/') && !raw.startsWith('//')) {
+    const key = keyFromPublicUrl(raw, env.MEDIA_PUBLIC_BASE ?? '');
+    if (!key) throw AppError.badRequest(`无法识别的站内图片地址：${raw}`);
+    const object = await env.MEDIA.get(key);
+    if (!object) throw AppError.badRequest(`站内图片不存在（可能已被删除）：${raw}`);
+    if (object.size > maxSize) throw AppError.payloadTooLarge(maxSizeMessage);
+    const bytes = new Uint8Array(await object.arrayBuffer());
+    return {
+      bytes,
+      // 以文件魔数为准，不能信任 R2 metadata 或 URL 后缀。
+      mime: sniffImageMime(bytes.slice(0, 32)) ?? '',
+      filename: key.split('/').pop() ?? 'image',
+    };
+  }
+
+  const media = await downloadRemote(raw, {
+    imageOnly: true,
+    maxSize,
+    maxSizeMessage,
+    timeoutMs: opts.timeoutMs,
+  });
+  return { bytes: media.bytes, mime: media.mime, filename: filenameFromUrl(raw) || 'image' };
+}
+
+/** 把图片字节写入 R2 与 `media` 表，返回公开地址。索引写失败时回滚 R2 对象。 */
+export async function storeImageInMedia(
+  env: Env,
+  bytes: Uint8Array,
+  mime: string,
+  filename: string,
+): Promise<IngestedImage> {
+  const key = mediaObjectKey(filename, mime);
+  await env.MEDIA.put(key, bytes, {
     httpMetadata: {
-      contentType: media.mime,
+      contentType: mime,
       cacheControl: 'public, max-age=31536000, immutable',
     },
   });
@@ -179,14 +231,35 @@ export async function ingestRemoteImage(
       key,
       url,
       filename,
-      media.bytes.byteLength,
-      media.mime,
+      bytes.byteLength,
+      mime,
       null,
     );
-    return { id: Number(result.meta.last_row_id), url, mime: media.mime, size: media.bytes.byteLength };
+    return { id: Number(result.meta.last_row_id), url, mime, size: bytes.byteLength };
   } catch (err) {
-    // 索引写失败就把对象删掉,避免 R2 里留下没有记录的孤儿文件。
     await env.MEDIA.delete(key).catch(() => undefined);
     throw err;
   }
+}
+
+/**
+ * 从公网 URL 下载一张图片,存入 R2 并写入 `media` 表,返回入库结果。
+ *
+ * 与「从 URL 上传媒体」工具走同一条链路,但只接受图片、上限为图片档位,
+ * 供定时发文的封面外链入库与 AI 助手配图复用。
+ */
+export async function ingestRemoteImage(
+  env: Env,
+  rawUrl: string,
+  filenameHint = 'image',
+): Promise<IngestedImage> {
+  const media = await downloadRemote(rawUrl, {
+    imageOnly: true,
+    maxSize: IMAGE_MAX_SIZE,
+    maxSizeMessage: '图片超过 8MB 限制',
+  });
+  if (isVideoMime(media.mime)) throw AppError.unsupportedMedia('封面必须是图片');
+
+  const filename = filenameFromUrl(rawUrl) || filenameHint;
+  return storeImageInMedia(env, media.bytes, media.mime, filename);
 }

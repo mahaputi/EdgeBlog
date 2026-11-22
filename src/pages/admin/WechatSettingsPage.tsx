@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type { WechatSettingsView } from '@shared/types';
 import { WECHAT_DEFAULTS } from '@shared/settings-defaults';
@@ -8,14 +8,17 @@ import { useDocumentTitle } from '../../hooks';
 import { useSettings } from '../../providers/SettingsProvider';
 import { useToast } from '../../providers/ToastProvider';
 import { Button } from '../../components/ui/Button';
-import { Input, Textarea } from '../../components/ui/Field';
+import { Input, Select, Textarea } from '../../components/ui/Field';
 import { Switch } from '../../components/ui/Switch';
-import { Card, EmptyState } from '../../components/ui/Feedback';
-import { Icon, type IconName } from '../../components/ui/icons';
+import { EmptyState } from '../../components/ui/Feedback';
+import { Section } from '../../components/ui/Section';
+import { Icon } from '../../components/ui/icons';
 import { MediaPicker } from '../../components/admin/MediaPicker';
-import { cn } from '../../lib/utils';
 
-type FormState = Omit<WechatSettingsView, 'hasAppSecret' | 'configured'>;
+type FormState = Omit<
+  WechatSettingsView,
+  'hasAppSecret' | 'hasImageCompressToken' | 'configured' | 'imageCompressToken'
+>;
 
 interface DraftRow {
   id: number;
@@ -28,45 +31,19 @@ interface DraftRow {
 }
 
 function toForm(view: WechatSettingsView): FormState {
-  const { hasAppSecret: _hasAppSecret, configured: _configured, ...rest } = view;
+  const {
+    hasAppSecret: _hasAppSecret,
+    hasImageCompressToken: _hasImageCompressToken,
+    configured: _configured,
+    ...rest
+  } = view;
   return rest;
 }
 
-/** Defaults with the view-only flags filled in; the stored secret is never loaded. */
-function defaultsForm(hasAppSecret: boolean): FormState {
-  const { appSecret: _appSecret, ...rest } = WECHAT_DEFAULTS;
-  return toForm({ ...rest, hasAppSecret, configured: false });
-}
-
-function Section({
-  title,
-  description,
-  icon,
-  children,
-  className,
-}: {
-  title: string;
-  description?: string;
-  icon?: IconName;
-  children: ReactNode;
-  className?: string;
-}) {
-  return (
-    <Card className={cn('flex flex-col p-5', className)}>
-      <div className="mb-4 flex items-start gap-3">
-        {icon && (
-          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-brand/10 text-brand">
-            <Icon name={icon} size={17} />
-          </span>
-        )}
-        <div className="min-w-0">
-          <h3 className="text-sm font-semibold text-fg">{title}</h3>
-          {description && <p className="mt-0.5 text-xs leading-relaxed text-muted">{description}</p>}
-        </div>
-      </div>
-      <div className="space-y-4">{children}</div>
-    </Card>
-  );
+/** Defaults with the view-only flags filled in; stored secrets are never loaded. */
+function defaultsForm(hasAppSecret: boolean, hasImageCompressToken: boolean): FormState {
+  const { appSecret: _appSecret, imageCompressToken: _token, ...rest } = WECHAT_DEFAULTS;
+  return toForm({ ...rest, hasAppSecret, hasImageCompressToken, configured: false });
 }
 
 /**
@@ -77,10 +54,13 @@ export function WechatSettingsPage() {
   const { settings } = useSettings();
   const { success, error: toastError } = useToast();
 
-  const [form, setForm] = useState<FormState>(() => defaultsForm(false));
+  const [form, setForm] = useState<FormState>(() => defaultsForm(false, false));
   const [hasAppSecret, setHasAppSecret] = useState(false);
   const [appSecret, setAppSecret] = useState('');
   const [clearSecret, setClearSecret] = useState(false);
+  const [hasCompressToken, setHasCompressToken] = useState(false);
+  const [compressToken, setCompressToken] = useState('');
+  const [clearCompressToken, setClearCompressToken] = useState(false);
   const [ready, setReady] = useState(false);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -105,6 +85,7 @@ export function WechatSettingsPage() {
         if (cancelled) return;
         setForm(toForm(data));
         setHasAppSecret(data.hasAppSecret);
+        setHasCompressToken(data.hasImageCompressToken);
       } catch (err) {
         if (!cancelled) toastError(err instanceof Error ? err.message : '加载公众号设置失败');
       } finally {
@@ -122,6 +103,7 @@ export function WechatSettingsPage() {
 
   const secretConfigured = hasAppSecret && !clearSecret;
   const configured = form.appId.trim().length > 0 && secretConfigured;
+  const compressConfigured = form.imageCompressUrl.trim().length > 0;
 
   const save = async () => {
     setSaving(true);
@@ -129,11 +111,16 @@ export function WechatSettingsPage() {
       const patch: Record<string, unknown> = { ...form };
       if (clearSecret) patch['clearAppSecret'] = true;
       else if (appSecret.trim() !== '') patch['appSecret'] = appSecret.trim();
+      if (clearCompressToken) patch['clearImageCompressToken'] = true;
+      else if (compressToken.trim() !== '') patch['imageCompressToken'] = compressToken.trim();
       const { data } = await api.patch<WechatSettingsView>('/wechat/settings', patch);
       setForm(toForm(data));
       setHasAppSecret(data.hasAppSecret);
+      setHasCompressToken(data.hasImageCompressToken);
       setAppSecret('');
       setClearSecret(false);
+      setCompressToken('');
+      setClearCompressToken(false);
       success('公众号设置已保存');
     } catch (err) {
       toastError(err instanceof Error ? err.message : '保存失败');
@@ -277,9 +264,128 @@ export function WechatSettingsPage() {
             label="仅粉丝可评论"
             description="仅在「自动打开评论」开启时生效"
           />
+          <Select
+            label="正文中的封面位置"
+            value={form.bodyCoverPosition}
+            onChange={(e) => set('bodyCoverPosition', e.target.value as FormState['bodyCoverPosition'])}
+            hint="仅影响公众号草稿正文，不修改站点文章；正文图需为 jpg/png 且单张小于 1MB。"
+          >
+            <option value="none">不插入</option>
+            <option value="top">正文顶部</option>
+            <option value="middle">正文中间</option>
+            <option value="bottom">正文底部</option>
+          </Select>
           <p className="text-xs leading-relaxed text-faint">
             封面取文章的封面图（微信 thumb_media_id 必填，无封面会拒绝推送）；正文图片会逐张上传到微信，
-            仅支持 jpg/png 且单张小于 1MB。
+            只接受 jpg/png、单张 1MB 以内。编辑器点推送时会先在浏览器里把 webp 等格式自动转成 jpg。
+          </p>
+          <Switch
+            checked={form.repairPushFailures}
+            onChange={(v) => set('repairPushFailures', v)}
+            label="图片错误时自动修复并重推一次"
+            description="仅处理公众号正文/封面的图片格式或体积问题；需要同时开启下方「在服务端压缩图片」，且只在 Workers 付费版可用。"
+          />
+          <Switch
+            checked={form.serverImageProcessing}
+            onChange={(v) => set('serverImageProcessing', v)}
+            label="在服务端用 wasm 压缩/转换图片（需要 Workers 付费版）"
+            description="免费版每个请求只有 10ms CPU，开启后推送会在 wasm 压缩阶段被 Cloudflare 终止（Error 1102）。免费版请改用下方「远程图片压缩接口」，或直接用编辑器推送（浏览器会先转成 jpg）。"
+          />
+        </Section>
+
+        <Section
+          title="远程图片压缩（可选）"
+          description="免费版替代 wasm 的方案：Worker 只把图片 POST 给该接口，做的是 I/O，不占 CPU"
+          icon="image"
+        >
+          <Input
+            label="压缩接口地址"
+            value={form.imageCompressUrl}
+            onChange={(e) => set('imageCompressUrl', e.target.value)}
+            placeholder="https://compress.scdn.io/api/compress.php"
+            hint="留空则关闭。需使用 https；查询参数可直接拼在地址上（如 uapis 的 ?format=jpeg&level=1）。"
+            autoComplete="off"
+          />
+          <div className="flex flex-wrap gap-2">
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              onClick={() => {
+                set('imageCompressUrl', 'https://uapis.cn/api/v1/image/compress?format=jpeg&level=1');
+                set('imageCompressField', 'file');
+                set('imageCompressParams', '');
+              }}
+            >
+              填入 uapis.cn 示例
+            </Button>
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              onClick={() => {
+                set('imageCompressUrl', 'https://compress.scdn.io/api/compress.php');
+                set('imageCompressField', 'image');
+                set('imageCompressParams', 'quality=75&outputFormat=jpeg&response=binary');
+              }}
+            >
+              填入 compress.scdn.io 示例
+            </Button>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Input
+              label="文件字段名"
+              value={form.imageCompressField}
+              onChange={(e) => set('imageCompressField', e.target.value)}
+              placeholder="file"
+              hint="multipart 里放图片的字段名：uapis 是 file，scdn 是 image。"
+              autoComplete="off"
+            />
+            <Input
+              label="附加表单参数（选填）"
+              value={form.imageCompressParams}
+              onChange={(e) => set('imageCompressParams', e.target.value)}
+              placeholder="quality=75&outputFormat=jpeg&response=binary"
+              hint="按表单字段追加，留空不传；scdn 建议加 response=binary（省 33% 带宽）。"
+              autoComplete="off"
+            />
+          </div>
+          <Input
+            label="接口 API Key（选填）"
+            type="password"
+            value={compressToken}
+            onChange={(e) => {
+              setCompressToken(e.target.value);
+              if (e.target.value) setClearCompressToken(false);
+            }}
+            placeholder={compressConfigured ? '留空表示保持不变' : '匿名调用可留空'}
+            autoComplete="off"
+            disabled={clearCompressToken}
+            hint="以 Authorization: Bearer <key> 发送，只保存在服务端。"
+          />
+          {hasCompressToken && (
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-xs text-muted">
+                {clearCompressToken ? '保存后将清除已存的 API Key' : '已保存一个 API Key'}
+              </span>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  setClearCompressToken((v) => !v);
+                  setCompressToken('');
+                }}
+              >
+                {clearCompressToken ? '取消清除' : '清除'}
+              </Button>
+            </div>
+          )}
+          <p className="text-xs leading-relaxed text-faint">
+            只对「微信不能直接收」的图调用（webp/avif、正文图 ≥1MB），合规的 jpg/png 不会浪费额度。
+            返回图片二进制或 JSON（base64 在 data 字段）都支持。实测 uapis.cn：100KB 约 2 秒、
+            4MB 约 37 秒、10MB 会 524；匿名额度约 1500 积分/30 天、每次 2 积分。
+            这些接口没有宽高/目标体积参数，压缩后仍超过 1MB 时会指名报错，请先用编辑器压缩。
           </p>
         </Section>
 
@@ -346,7 +452,7 @@ export function WechatSettingsPage() {
                 </Button>
               </div>
               <p className="text-xs text-faint">
-                正文图要求 jpg/png 且单张小于 1MB；留空则渲染无图卡片。
+                卡片配图需为 jpg/png 且小于 1MB（微信正文图限制），留空则渲染无图卡片。
               </p>
               {form.miniprogramImage && (
                 <img

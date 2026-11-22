@@ -4,6 +4,7 @@
  *   GET    /api/wechat/settings          读取配置（AppSecret 以 hasAppSecret 掩码）
  *   PATCH  /api/wechat/settings          保存配置（空 appSecret 表示保持不变）
  *   POST   /api/wechat/test              连通性自检（拉一次 access_token）
+ *   POST   /api/wechat/preflight        公众号正文长度预检(不调微信接口,纯本地计算)
  *   POST   /api/wechat/posts/:id/draft   把一篇文章推送到草稿箱
  *   GET    /api/wechat/drafts            已推送过草稿的文章列表
  *
@@ -21,19 +22,22 @@ import { ok } from '../lib/response';
 import { parseJson } from '../lib/validate';
 import { getPostById } from '../lib/posts-repo';
 import { readWechatSettings, wechatConfigured, writeWechatSettings } from '../lib/wechat-settings';
-import { pushPostToWechatDraft, getWechatDraft, listWechatDrafts } from '../lib/wechat-draft';
+import { getWechatDraft, listWechatDrafts, WECHAT_PUSH_BUDGET_MS } from '../lib/wechat-draft';
+import { pushPostToWechatWithRepair } from '../lib/wechat-repair';
+import { buildWechatBody, measureWechatBody, miniProgramCardFromSettings } from '../lib/wechat-length';
 import { testWechatConnection } from '../lib/wechat';
 
 export const wechatRoutes = new Hono<AppEnv>();
 
 wechatRoutes.use('*', requireAdmin);
 
-/** 掩码后的配置视图：绝不把 AppSecret 交给前端。 */
+/** 掩码后的配置视图：绝不把 AppSecret / 压缩接口 Key 交给前端。 */
 function view(settings: WechatSettings): WechatSettingsView {
-  const { appSecret, ...rest } = settings;
+  const { appSecret, imageCompressToken, ...rest } = settings;
   return {
     ...rest,
     hasAppSecret: appSecret.trim().length > 0,
+    hasImageCompressToken: imageCompressToken.trim().length > 0,
     configured: wechatConfigured(settings),
   };
 }
@@ -61,6 +65,14 @@ const patchSchema = z
     author: z.string().trim().max(16),
     openComment: z.boolean(),
     onlyFansCanComment: z.boolean(),
+    bodyCoverPosition: z.enum(['none', 'top', 'middle', 'bottom']),
+    repairPushFailures: z.boolean(),
+    serverImageProcessing: z.boolean(),
+    imageCompressUrl: z.string().trim().max(512),
+    imageCompressToken: z.string().max(256),
+    clearImageCompressToken: z.boolean(),
+    imageCompressField: z.string().trim().max(32),
+    imageCompressParams: z.string().trim().max(512),
     miniprogramEnabled: z.boolean(),
     miniprogramAppId: z.string().trim().max(64),
     miniprogramPath: z.string().trim().max(256),
@@ -73,10 +85,15 @@ const patchSchema = z
 
 /** Admin: patch the config. An empty `appSecret` keeps the stored one. */
 wechatRoutes.patch('/settings', async (c) => {
-  const { clearAppSecret, appSecret, ...rest } = await parseJson(c, patchSchema);
+  const { clearAppSecret, appSecret, clearImageCompressToken, imageCompressToken, ...rest } =
+    await parseJson(c, patchSchema);
   const patch: Partial<WechatSettings> = { ...rest };
   if (clearAppSecret) patch.appSecret = '';
   else if (appSecret !== undefined && appSecret.trim() !== '') patch.appSecret = appSecret.trim();
+  if (clearImageCompressToken) patch.imageCompressToken = '';
+  else if (imageCompressToken !== undefined && imageCompressToken.trim() !== '') {
+    patch.imageCompressToken = imageCompressToken.trim();
+  }
   const saved = await writeWechatSettings(c.env, patch);
   await recordAudit(c.env, c.get('user'), 'wechat.settings.update', 'setting', null, {
     enabled: saved.enabled,
@@ -94,6 +111,35 @@ wechatRoutes.post('/test', async (c) => {
   const settings = await requireWechatReady(c.env);
   const message = await testWechatConnection(c.env, settings);
   return ok(c, { message });
+});
+
+const preflightSchema = z.object({
+  contentMd: z.string().max(500_000).default(''),
+  coverUrl: z.string().trim().max(2048).nullable().optional(),
+});
+
+/**
+ * Admin:公众号正文长度预检。
+ *
+ * 微信 2 万字符限制统计的是渲染后的 HTML 字符串,所以这里不猜:直接用与推送
+ * 同一套装配逻辑算一遍,把「渲染后字符数 / 上限」回给编辑器与 AI。
+ * 不调用任何微信接口,纯本地计算。
+ */
+wechatRoutes.post('/preflight', async (c) => {
+  const user = c.get('user');
+  if (!user) throw AppError.unauthorized();
+  // 编辑器输入时会反复调用,给一个宽松但有上限的频次。
+  const limited = await hit(c.env, `wechat:preflight:${user.id}`, 120, 300);
+  if (!limited.allowed) throw AppError.rateLimited('检查过于频繁,请稍后再试');
+  const body = await parseJson(c, preflightSchema);
+  const settings = await readWechatSettings(c.env);
+  const built = buildWechatBody({
+    markdown: body.contentMd,
+    coverUrl: body.coverUrl ?? '',
+    bodyCoverPosition: settings.bodyCoverPosition,
+    card: miniProgramCardFromSettings(settings),
+  });
+  return ok(c, measureWechatBody(built, body.contentMd));
 });
 
 /** Admin: push one post to the official-account draft box. */
@@ -115,12 +161,20 @@ wechatRoutes.post('/posts/:id/draft', async (c) => {
   // 阅读原文指向部署站点；SITE_URL 未配置时不下发该字段。
   const siteUrl = (c.env.SITE_URL ?? '').trim() || undefined;
 
-  const result = await pushPostToWechatDraft(c.env, settings, post, { siteUrl });
+  // 交互式推送是同步请求，而 Cloudflare 边缘在 125 秒没有响应就会断开（524）。
+  // 因此整条「推送 / 修复后重推」的预算压在 100 秒内，让服务端先返回明确的
+  // 超时原因，而不是让浏览器等一个已经被边缘丢弃的连接。
+  const result = await pushPostToWechatWithRepair(c.env, settings, post, {
+    siteUrl,
+    actor: user,
+    budgetMs: WECHAT_PUSH_BUDGET_MS,
+  });
   await recordAudit(c.env, user, 'wechat.push', 'post', id, {
     mediaId: result.mediaId,
     updated: result.updated,
     imageCount: result.imageCount,
     title: result.title,
+    repaired: result.repaired,
   });
   return ok(c, result);
 });

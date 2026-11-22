@@ -245,6 +245,69 @@ describe('runToolAgent 取数轮与流式成文', () => {
   });
 });
 
+describe('count_chars 工具', () => {
+  it('按字符统计,并返回公众号预检口径的字符数', async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    let round = 0;
+    const env = fakeEnv(async (_model, inputs) => {
+      seen.push(inputs);
+      round += 1;
+      if (round === 1) {
+        return openAiReply('', [
+          {
+            id: 'call_1',
+            function: {
+              name: 'count_chars',
+              arguments: JSON.stringify({ text: '你好世界 hello world 😀' }),
+            },
+          },
+        ]);
+      }
+      return openAiReply('统计完成');
+    });
+
+    const result = await runToolAgent(env, null, 'sys', '数一下字符数', {
+      maxRounds: 2,
+      tools: ['count_chars'],
+    });
+
+    expect(result.actions).toHaveLength(1);
+    expect(result.actions[0]?.tool).toBe('count_chars');
+    expect(result.actions[0]?.ok).toBe(true);
+    expect(result.actions[0]?.summary).toContain('公众号正文');
+
+    const messages = seen[1]?.messages as Array<{ role: string; content?: string }>;
+    const toolMessage = messages.find((message) => message.role === 'tool');
+    const payload = JSON.parse(toolMessage?.content ?? '{}') as {
+      data?: {
+        chars?: number;
+        charsMin?: number;
+        limitChars?: number;
+        overChars?: number;
+        ok?: boolean;
+        markdownChars?: number;
+        visibleChars?: number;
+        styleChars?: number;
+        error?: string | null;
+        markdownStats?: { chars?: number; charsNoSpace?: number };
+      };
+    };
+    // 汉字与 emoji 都按 1 个字符算:18 个字符的 Markdown
+    expect(payload.data?.markdownChars).toBe(18);
+    expect(payload.data?.markdownStats?.chars).toBe(18);
+    expect(payload.data?.limitChars).toBe(20_000);
+    // 预检口径是渲染后的 HTML:标签与内联样式会让长度明显超过 18
+    expect(payload.data?.chars).toBeGreaterThan(18);
+    expect(payload.data?.charsMin).toBeLessThanOrEqual(payload.data?.chars ?? 0);
+    // 可见文字:去掉标签与空白后的 15 个字符(4 汉字 + 10 字母 + 1 emoji)
+    expect(payload.data?.visibleChars).toBe(15);
+    expect(payload.data?.styleChars).toBeGreaterThan(0);
+    expect(payload.data?.overChars).toBe(0);
+    expect(payload.data?.ok).toBe(true);
+    expect(payload.data?.error).toBeNull();
+  });
+});
+
 describe('runToolAgent 整体预算', () => {
   it('预算耗尽时不再提供工具,直接让模型收尾成文', async () => {
     const seen: Array<Record<string, unknown>> = [];
